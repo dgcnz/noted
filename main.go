@@ -123,7 +123,7 @@ func main() {
 	args := os.Args[1:]
 	if len(args) > 0 {
 		switch args[0] {
-		case "view", "export", "help":
+		case "view", "export", "diff", "help":
 			cmd = args[0]
 			args = args[1:]
 		}
@@ -135,6 +135,8 @@ func main() {
 		err = runView(args)
 	case "export":
 		err = runExport(args)
+	case "diff":
+		err = runDiff(args)
 	case "help":
 		printUsage(os.Stdout)
 	default:
@@ -149,11 +151,13 @@ func main() {
 func printUsage(w *os.File) {
 	fmt.Fprint(w, `Usage:
   noted view   [-notes DIR] [-root ID] [-md-style STYLE]
-  noted export [-notes DIR] [-root ID] [-o FILE] [-metadata]
+  noted export [-notes DIR] [-o FILE] [-metadata] [--index-only] [--recurse N] NOTE_ID...
+  noted diff   --base COMMIT [-notes DIR] [--index-only] [--recurse N] [NOTE_ID...]
 
 Commands:
   view     interactive note explorer
   export   export a single combined markdown report
+  diff     show note diffs against a git base commit
 `)
 }
 
@@ -163,7 +167,18 @@ func runView(args []string) error {
 	notesDir := fs.String("notes", "", "path to notes directory")
 	rootID := fs.String("root", "r000-main", "root note id")
 	mdStyle := fs.String("md-style", "ascii", "markdown style: ascii|notty|light|dark|auto")
+	fs.Usage = func() {
+		fmt.Fprint(os.Stderr, `Usage:
+  noted view [-notes DIR] [-root ID] [-md-style STYLE]
+
+Options:
+`)
+		fs.PrintDefaults()
+	}
 	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return nil
+		}
 		return err
 	}
 	if !validMarkdownStyle(*mdStyle) {
@@ -188,26 +203,154 @@ func runExport(args []string) error {
 	fs := flag.NewFlagSet("export", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	notesDir := fs.String("notes", "", "path to notes directory")
-	rootID := fs.String("root", "r000-main", "root note id")
-	outPath := fs.String("o", "", "output markdown path (default: stdout)")
+	outPath := fs.String("o", "", "output path (default: stdout)")
 	includeMetadata := fs.Bool("metadata", false, "include note metadata blocks")
+	indexOnly := fs.Bool("index-only", false, "print only selected note ids in export order")
+	recurseDepth := fs.Int("recurse", -1, "recursion depth: default unlimited, 0 exact-only")
+	fs.Usage = func() {
+		fmt.Fprint(os.Stderr, `Usage:
+  noted export [-notes DIR] [-o FILE] [-metadata] [--index-only] [--recurse N] NOTE_ID...
+
+Behavior:
+  default recurse: unlimited
+  --recurse 0: export exactly NOTE_ID...
+  --recurse N: recurse N levels
+
+Options:
+`)
+		fs.PrintDefaults()
+	}
 	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return nil
+		}
 		return err
+	}
+	if *recurseDepth < -1 {
+		return fmt.Errorf("invalid --recurse %d", *recurseDepth)
 	}
 	if *notesDir == "" {
 		*notesDir = filepath.Join(".", "notes")
 	}
+	rootIDs := fs.Args()
+	if len(rootIDs) == 0 {
+		return fmt.Errorf("export requires at least one NOTE_ID")
+	}
 
-	g, err := loadGraph(*notesDir, *rootID)
+	notes, err := loadNotes(*notesDir)
 	if err != nil {
 		return err
 	}
-	out := exportMarkdown(g, exportOptions{IncludeMetadata: *includeMetadata})
+	for _, id := range rootIDs {
+		if _, ok := notes[id]; !ok {
+			return fmt.Errorf("note %q not found in %s", id, *notesDir)
+		}
+	}
+	adj := buildAdjacency(notes)
+	order := resolveExportOrder(adj, rootIDs, *recurseDepth)
+	var out string
+	if *indexOnly {
+		out = strings.Join(order, "\n")
+		if out != "" {
+			out += "\n"
+		}
+	} else {
+		out = exportMarkdown(notes, adj, exportOptions{
+			IncludeMetadata: *includeMetadata,
+			Roots:           rootIDs,
+			RecurseDepth:    *recurseDepth,
+		})
+	}
 	if *outPath == "" {
 		fmt.Print(out)
 		return nil
 	}
 	return os.WriteFile(*outPath, []byte(out), 0o644)
+}
+
+func runDiff(args []string) error {
+	fs := flag.NewFlagSet("diff", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	notesDir := fs.String("notes", "", "path to notes directory")
+	base := fs.String("base", "", "git commit/ref to diff against")
+	indexOnly := fs.Bool("index-only", false, "print only changed note ids in diff order")
+	recurseDepth := fs.Int("recurse", -1, "recursion depth for NOTE_ID filters: default unlimited, 0 exact-only")
+	fs.Usage = func() {
+		fmt.Fprint(os.Stderr, `Usage:
+  noted diff --base COMMIT [-notes DIR] [--index-only] [--recurse N] [NOTE_ID...]
+
+Behavior:
+  NOTE_ID omitted: include all changed notes
+  NOTE_ID provided: default recurse is unlimited
+  --recurse 0: diff exactly NOTE_ID...
+  --recurse N: recurse N levels from NOTE_ID...
+
+Options:
+`)
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return nil
+		}
+		return err
+	}
+	if *base == "" {
+		return fmt.Errorf("diff requires --base COMMIT")
+	}
+	if *recurseDepth < -1 {
+		return fmt.Errorf("invalid --recurse %d", *recurseDepth)
+	}
+	if *notesDir == "" {
+		*notesDir = filepath.Join(".", "notes")
+	}
+
+	notes, err := loadNotes(*notesDir)
+	if err != nil {
+		return err
+	}
+	repoRoot, err := gitRepoRoot(*notesDir)
+	if err != nil {
+		return err
+	}
+	if err := validateGitBase(repoRoot, *base); err != nil {
+		return err
+	}
+
+	order, err := resolveDiffOrder(notes, repoRoot, *base, fs.Args(), *recurseDepth)
+	if err != nil {
+		return err
+	}
+	if *indexOnly {
+		out := strings.Join(order, "\n")
+		if out != "" {
+			out += "\n"
+		}
+		fmt.Print(out)
+		return nil
+	}
+
+	parts := make([]string, 0, len(order))
+	for _, id := range order {
+		n := notes[id]
+		relPath, err := filepath.Rel(repoRoot, n.Path)
+		if err != nil {
+			return err
+		}
+		diff, err := gitDiffPath(repoRoot, *base, relPath)
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(diff) == "" {
+			continue
+		}
+		parts = append(parts, strings.TrimRight(diff, "\n"))
+	}
+	if len(parts) == 0 {
+		return nil
+	}
+	fmt.Println(strings.Join(parts, "\n\n"))
+	return nil
 }
 
 func loadGraph(notesDir, rootID string) (*graph, error) {
@@ -233,15 +376,121 @@ func loadGraph(notesDir, rootID string) (*graph, error) {
 
 type exportOptions struct {
 	IncludeMetadata bool
+	Roots           []string
+	RecurseDepth    int
 }
 
-func exportMarkdown(g *graph, opts exportOptions) string {
+func resolveExportOrder(adj map[string][]string, roots []string, recurseDepth int) []string {
+	order := []string{}
+	seen := map[string]bool{}
+
+	var walk func(id string, depth int)
+	walk = func(id string, depth int) {
+		if seen[id] {
+			return
+		}
+		seen[id] = true
+		order = append(order, id)
+		if recurseDepth == 0 || (recurseDepth > 0 && depth >= recurseDepth) {
+			return
+		}
+		for _, child := range exportChildren(adj, id) {
+			walk(child, depth+1)
+		}
+	}
+
+	for _, id := range roots {
+		walk(id, 0)
+	}
+	return order
+}
+
+func resolveDiffOrder(notes map[string]*note, repoRoot, base string, roots []string, recurseDepth int) ([]string, error) {
+	if len(roots) > 0 {
+		for _, id := range roots {
+			if _, ok := notes[id]; !ok {
+				return nil, fmt.Errorf("note %q not found", id)
+			}
+		}
+		adj := buildAdjacency(notes)
+		order := resolveExportOrder(adj, roots, recurseDepth)
+		return filterChangedNotes(notes, repoRoot, base, order)
+	}
+
+	ids := make([]string, 0, len(notes))
+	for id := range notes {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return filterChangedNotes(notes, repoRoot, base, ids)
+}
+
+func filterChangedNotes(notes map[string]*note, repoRoot, base string, ids []string) ([]string, error) {
+	changed := make([]string, 0, len(ids))
+	for _, id := range ids {
+		n, ok := notes[id]
+		if !ok {
+			continue
+		}
+		relPath, err := filepath.Rel(repoRoot, n.Path)
+		if err != nil {
+			return nil, err
+		}
+		differs, err := noteChanged(repoRoot, base, relPath)
+		if err != nil {
+			return nil, err
+		}
+		if differs {
+			changed = append(changed, id)
+		}
+	}
+	return changed, nil
+}
+
+func gitRepoRoot(path string) (string, error) {
+	out, err := exec.Command("git", "-C", path, "rev-parse", "--show-toplevel").CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("resolve git repo root: %s", strings.TrimSpace(string(out)))
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+func validateGitBase(repoRoot, base string) error {
+	out, err := exec.Command("git", "-C", repoRoot, "rev-parse", "--verify", base+"^{commit}").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("invalid base %q: %s", base, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func noteChanged(repoRoot, base, relPath string) (bool, error) {
+	cmd := exec.Command("git", "-C", repoRoot, "diff", "--quiet", base, "--", relPath)
+	err := cmd.Run()
+	if err == nil {
+		return false, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return true, nil
+	}
+	return false, err
+}
+
+func gitDiffPath(repoRoot, base, relPath string) (string, error) {
+	out, err := exec.Command("git", "-C", repoRoot, "diff", base, "--", relPath).CombinedOutput()
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+func exportMarkdown(notes map[string]*note, adj map[string][]string, opts exportOptions) string {
 	var b strings.Builder
 	seen := map[string]bool{}
 
 	var walk func(id string, depth int)
 	walk = func(id string, depth int) {
-		n, ok := g.Notes[id]
+		n, ok := notes[id]
 		if !ok || seen[id] {
 			return
 		}
@@ -272,55 +521,52 @@ func exportMarkdown(g *graph, opts exportOptions) string {
 			b.WriteString("\n\n")
 		}
 
-		body := strings.TrimSpace(rewriteNoteLinks(n.Body, g.Notes))
+		body := strings.TrimSpace(rewriteNoteLinks(n.Body, notes))
 		if body != "" {
 			b.WriteString(body)
 			b.WriteString("\n\n")
 		}
 
-		repeats := []string{}
-		for _, child := range exportChildren(g, id) {
-			if seen[child] {
-				repeats = append(repeats, child)
-				continue
-			}
-			walk(child, depth+1)
-		}
-		if len(repeats) > 0 {
-			labels := make([]string, 0, len(repeats))
-			for _, child := range repeats {
-				if n, ok := g.Notes[child]; ok {
-					labels = append(labels, fmt.Sprintf("[%s](#%s)", shortID(n.ID), n.ID))
+		if opts.RecurseDepth != 0 && (opts.RecurseDepth < 0 || depth < opts.RecurseDepth) {
+			repeats := []string{}
+			for _, child := range exportChildren(adj, id) {
+				if seen[child] {
+					repeats = append(repeats, child)
+					continue
 				}
+				walk(child, depth+1)
 			}
-			if len(labels) > 0 {
-				b.WriteString("Already covered: ")
-				b.WriteString(strings.Join(labels, ", "))
-				b.WriteString("\n\n")
+			if len(repeats) > 0 {
+				labels := make([]string, 0, len(repeats))
+				for _, child := range repeats {
+					if n, ok := notes[child]; ok {
+						labels = append(labels, fmt.Sprintf("[%s](#%s)", shortID(n.ID), n.ID))
+					}
+				}
+				if len(labels) > 0 {
+					b.WriteString("Already covered: ")
+					b.WriteString(strings.Join(labels, ", "))
+					b.WriteString("\n\n")
+				}
 			}
 		}
 	}
 
-	walk(g.RootID, 0)
+	for _, id := range opts.Roots {
+		walk(id, 0)
+	}
 	return strings.TrimSpace(b.String()) + "\n"
 }
 
-func exportChildren(g *graph, id string) []string {
+func exportChildren(adj map[string][]string, id string) []string {
 	children := []string{}
 	seen := map[string]bool{}
-	for _, child := range g.PrimaryEdges[id] {
-		if seen[child.ID] {
+	for _, child := range adj[id] {
+		if seen[child] {
 			continue
 		}
-		seen[child.ID] = true
-		children = append(children, child.ID)
-	}
-	for _, child := range g.SecondaryEdges[id] {
-		if seen[child.ID] {
-			continue
-		}
-		seen[child.ID] = true
-		children = append(children, child.ID)
+		seen[child] = true
+		children = append(children, child)
 	}
 	return children
 }
@@ -344,8 +590,12 @@ func rewriteNoteLinks(text string, notes map[string]*note) string {
 }
 
 func loadNotes(notesDir string) (map[string]*note, error) {
+	notesDir, err := filepath.Abs(notesDir)
+	if err != nil {
+		return nil, err
+	}
 	notes := map[string]*note{}
-	err := filepath.WalkDir(notesDir, func(path string, d fs.DirEntry, err error) error {
+	err = filepath.WalkDir(notesDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
