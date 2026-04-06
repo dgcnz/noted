@@ -69,7 +69,6 @@ type model struct {
 	ready         bool
 	viewport      viewport.Model
 	status        string
-	showMetadata  bool
 	mdStyle       string
 	renderer      *glamour.TermRenderer
 	rendererWidth int
@@ -729,14 +728,13 @@ func buildTraversal(adj map[string][]string, rootID string) (map[string][]edge, 
 
 func newModel(g *graph, mdStyle string) model {
 	m := model{
-		graph:        g,
-		rootID:       g.RootID,
-		expanded:     map[string]bool{g.RootID: true},
-		showMetadata: false,
-		mdStyle:      mdStyle,
-		noteCache:    map[string]string{},
-		refsCache:    map[string][]string{},
-		status:       "arrows/jk move | [count]+right expand N levels | left collapse | enter focus viewer | tab cycle refs | enter open ref | esc back | e edit note | m toggle metadata | q quit",
+		graph:     g,
+		rootID:    g.RootID,
+		expanded:  map[string]bool{g.RootID: true},
+		mdStyle:   mdStyle,
+		noteCache: map[string]string{},
+		refsCache: map[string][]string{},
+		status:    "arrows/jk move | [count]+right expand N levels | left collapse | enter focus viewer | tab cycle refs | enter open ref | esc back | e edit note | q quit",
 	}
 	m.rebuildLines()
 	return m
@@ -761,12 +759,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "e":
 			m.prefix = ""
 			return m, m.openEditor()
-		case "m":
-			m.prefix = ""
-			m.showMetadata = !m.showMetadata
-			m.viewportKey = ""
-			m.syncViewport()
-			return m, nil
 		}
 
 		if m.focusRight {
@@ -1130,25 +1122,6 @@ func (m model) renderNote(id string) string {
 	width := max(30, m.viewport.Width-2)
 	var parts []string
 	parts = append(parts, titleStyle.Render(n.Title))
-	if m.showMetadata {
-		meta := []string{
-			fmt.Sprintf("id: %s", n.ID),
-			fmt.Sprintf("path: %s", n.Path),
-		}
-		if n.Type != "" {
-			meta = append(meta, fmt.Sprintf("type: %s", n.Type))
-		}
-		if n.Parent != "" {
-			meta = append(meta, fmt.Sprintf("parent: %s", n.Parent))
-		}
-		if len(n.Children) > 0 {
-			meta = append(meta, fmt.Sprintf("children: %s", strings.Join(n.Children, ", ")))
-		}
-		if len(n.Tags) > 0 {
-			meta = append(meta, fmt.Sprintf("tags: %s", strings.Join(n.Tags, ", ")))
-		}
-		parts = append(parts, dimStyle.Render(strings.Join(meta, "\n")))
-	}
 
 	body := n.Body
 	if body == "" {
@@ -1254,7 +1227,7 @@ func validMarkdownStyle(style string) bool {
 }
 
 func (m model) noteCacheKey(id string) string {
-	return fmt.Sprintf("%s|%d|%t|%s", id, max(30, m.viewport.Width-2), m.showMetadata, m.mdStyle)
+	return fmt.Sprintf("%s|%d|%s", id, max(30, m.viewport.Width-2), m.mdStyle)
 }
 
 func (m *model) cycleReference(delta int) {
